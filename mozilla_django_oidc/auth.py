@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import logging
+import time
 
 import inspect
 import jwt
@@ -10,10 +11,12 @@ from django.contrib.auth.backends import ModelBackend
 from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
 from django.urls import reverse
 from django.utils.encoding import force_bytes, smart_str
+from django.utils.functional import cached_property
 from django.utils.module_loading import import_string
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import HTTPError
 
+from mozilla_django_oidc import discovery
 from mozilla_django_oidc.utils import absolutify, import_from_settings
 
 LOGGER = logging.getLogger(__name__)
@@ -44,21 +47,34 @@ class OIDCAuthenticationBackend(ModelBackend):
 
     def __init__(self, *args, **kwargs):
         """Initialize settings."""
-        self.OIDC_OP_TOKEN_ENDPOINT = self.get_settings("OIDC_OP_TOKEN_ENDPOINT")
-        self.OIDC_OP_USER_ENDPOINT = self.get_settings("OIDC_OP_USER_ENDPOINT")
-        self.OIDC_OP_JWKS_ENDPOINT = self.get_settings("OIDC_OP_JWKS_ENDPOINT", None)
+        if discovery.discovery_url() is None:
+            # Without discovery configured, resolve endpoints eagerly as
+            # upstream does. With discovery, they stay lazy (cached_property)
+            # so that no network I/O happens at instantiation time.
+            self.OIDC_OP_TOKEN_ENDPOINT = self.get_settings("OIDC_OP_TOKEN_ENDPOINT")
+            self.OIDC_OP_USER_ENDPOINT = self.get_settings("OIDC_OP_USER_ENDPOINT")
+            self.OIDC_OP_JWKS_ENDPOINT = self.get_settings(
+                "OIDC_OP_JWKS_ENDPOINT", None
+            )
         self.OIDC_RP_CLIENT_ID = self.get_settings("OIDC_RP_CLIENT_ID")
         self.OIDC_RP_CLIENT_SECRET = self.get_settings("OIDC_RP_CLIENT_SECRET")
         self.OIDC_RP_SIGN_ALGO = self.get_settings("OIDC_RP_SIGN_ALGO", "HS256")
         self.OIDC_RP_IDP_SIGN_KEY = self.get_settings("OIDC_RP_IDP_SIGN_KEY", None)
 
+        # Do not resolve endpoints via discovery here: backends are
+        # instantiated at startup and must not perform network I/O then.
         if (
             self.OIDC_RP_SIGN_ALGO.startswith("RS")
             or self.OIDC_RP_SIGN_ALGO.startswith("ES")
         ) and (
-            self.OIDC_RP_IDP_SIGN_KEY is None and self.OIDC_OP_JWKS_ENDPOINT is None
+            self.OIDC_RP_IDP_SIGN_KEY is None
+            and import_from_settings("OIDC_OP_JWKS_ENDPOINT", None) is None
+            and discovery.discovery_url() is None
         ):
-            msg = "{} alg requires OIDC_RP_IDP_SIGN_KEY or OIDC_OP_JWKS_ENDPOINT to be configured."
+            msg = (
+                "{} alg requires OIDC_RP_IDP_SIGN_KEY, OIDC_OP_JWKS_ENDPOINT "
+                "or OIDC_OP_DISCOVERY_ENDPOINT to be configured."
+            )
             raise ImproperlyConfigured(msg.format(self.OIDC_RP_SIGN_ALGO))
 
         self.UserModel = get_user_model()
@@ -66,6 +82,21 @@ class OIDCAuthenticationBackend(ModelBackend):
     @staticmethod
     def get_settings(attr, *args):
         return import_from_settings(attr, *args)
+
+    # These cached properties are only reached when discovery is configured;
+    # otherwise __init__ sets the instance attributes eagerly (upstream
+    # behavior) and shadows them.
+    @cached_property
+    def OIDC_OP_TOKEN_ENDPOINT(self):
+        return discovery.get_endpoint_setting("OIDC_OP_TOKEN_ENDPOINT")
+
+    @cached_property
+    def OIDC_OP_USER_ENDPOINT(self):
+        return discovery.get_endpoint_setting("OIDC_OP_USER_ENDPOINT")
+
+    @cached_property
+    def OIDC_OP_JWKS_ENDPOINT(self):
+        return discovery.get_endpoint_setting("OIDC_OP_JWKS_ENDPOINT", None)
 
     def describe_user_by_claims(self, claims):
         email = claims.get("email")
@@ -310,12 +341,14 @@ class OIDCAuthenticationBackend(ModelBackend):
         token_info = self.get_token(token_payload)
         id_token = token_info.get("id_token")
         access_token = token_info.get("access_token")
+        refresh_token = token_info.get("refresh_token")
 
         # Validate the token
         payload = self.verify_token(id_token, nonce=nonce)
 
         if payload:
-            self.store_tokens(access_token, id_token)
+            self.store_token_expirations(token_info)
+            self.store_tokens_compat(access_token, id_token, refresh_token)
             try:
                 return self.get_or_create_user(access_token, id_token, payload)
             except SuspiciousOperation as exc:
@@ -324,7 +357,17 @@ class OIDCAuthenticationBackend(ModelBackend):
 
         return None
 
-    def store_tokens(self, access_token, id_token):
+    def store_tokens_compat(self, access_token, id_token, refresh_token=None):
+        """Call store_tokens, supporting overrides with the pre-refresh-token
+        two-argument signature."""
+        if len(inspect.getfullargspec(self.store_tokens).args) <= 3:
+            # this is for backwards compatibility only
+            self.store_tokens(access_token, id_token)
+            self.store_refresh_token(refresh_token)
+        else:
+            self.store_tokens(access_token, id_token, refresh_token)
+
+    def store_tokens(self, access_token, id_token, refresh_token=None):
         """Store OIDC tokens."""
         session = self.request.session
 
@@ -333,6 +376,42 @@ class OIDCAuthenticationBackend(ModelBackend):
 
         if self.get_settings("OIDC_STORE_ID_TOKEN", False):
             session["oidc_id_token"] = id_token
+
+        self.store_refresh_token(refresh_token)
+
+    def store_refresh_token(self, refresh_token):
+        """Store the OIDC refresh token if configured to do so."""
+        if not self.get_settings("OIDC_STORE_REFRESH_TOKEN", False):
+            return
+
+        if refresh_token is None:
+            return
+
+        session_engine = self.get_settings(
+            "SESSION_ENGINE", "django.contrib.sessions.backends.db"
+        )
+        if "signed_cookies" in session_engine:
+            LOGGER.warning(
+                "Storing the OIDC refresh token in a signed-cookie session. "
+                "Use a server-side session backend to keep refresh tokens "
+                "off the client."
+            )
+
+        self.request.session["oidc_refresh_token"] = refresh_token
+
+    def store_token_expirations(self, token_info):
+        """Record the real token lifetimes from the token endpoint response."""
+        session = self.request.session
+        now = time.time()
+
+        expires_in = token_info.get("expires_in")
+        if expires_in is not None:
+            session["oidc_token_expiration"] = now + expires_in
+
+        # Keycloak includes the refresh token lifetime as refresh_expires_in.
+        refresh_expires_in = token_info.get("refresh_expires_in")
+        if refresh_expires_in is not None:
+            session["oidc_refresh_token_expiration"] = now + refresh_expires_in
 
     def get_or_create_user(self, access_token, id_token, payload):
         """Returns a User instance if 1 user is found. Creates a user if not found

@@ -790,3 +790,47 @@ class OIDCLogoutViewTestCase(TestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.url, "http://testserver/logged/out")
+
+
+class UseTokenExpirationTestCase(TestCase):
+    """login_success uses the real token expiration when configured."""
+
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def _login(self):
+        user = User.objects.create_user("example_username")
+        get_data = {"code": "example_code", "state": "example_state"}
+        url = reverse("oidc_authentication_callback")
+        request = self.factory.get(url, get_data)
+        client = Client()
+        request.session = client.session
+        request.session["oidc_states"] = {
+            "example_state": {"code_verifier": None, "nonce": None, "added_on": time.time()},
+        }
+        callback_view = views.OIDCAuthenticationCallbackView.as_view()
+
+        def fake_authenticate(**kwargs):
+            # The backend records the real token expiration in the session.
+            kwargs["request"].session["oidc_token_expiration"] = time.time() + 300
+            return user
+
+        with patch("mozilla_django_oidc.views.auth.authenticate") as mock_auth:
+            with patch("mozilla_django_oidc.views.auth.login"):
+                mock_auth.side_effect = fake_authenticate
+                callback_view(request)
+        return request
+
+    @override_settings(OIDC_USE_TOKEN_EXPIRATION=True)
+    def test_real_expiration_used(self):
+        request = self._login()
+        self.assertAlmostEqual(
+            request.session["oidc_id_token_expiration"], time.time() + 300, delta=5
+        )
+
+    @override_settings(OIDC_RENEW_ID_TOKEN_EXPIRY_SECONDS=120)
+    def test_synthetic_expiration_by_default(self):
+        request = self._login()
+        self.assertAlmostEqual(
+            request.session["oidc_id_token_expiration"], time.time() + 120, delta=5
+        )

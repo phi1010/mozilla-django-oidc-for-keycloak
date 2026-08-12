@@ -200,6 +200,53 @@ of ``mozilla-django-oidc``.
    Controls whether the OpenID Connect client stores the OIDC ``id_token`` in the user session.
    The session key used to store the data is ``oidc_id_token``.
 
+.. py:attribute:: OIDC_STORE_REFRESH_TOKEN
+
+   :default: ``False``
+
+   Controls whether the OpenID Connect client stores the OIDC ``refresh_token`` in the user session.
+   The session key used to store the data is ``oidc_refresh_token``.
+
+   Required by the :class:`mozilla_django_oidc.middleware.RefreshOIDCToken` middleware,
+   which uses the refresh token to renew tokens server-side before they expire.
+
+   .. warning::
+      Refresh tokens are long-lived credentials. Use a server-side session backend
+      (database or cache); do not combine this with the ``signed_cookies`` session
+      engine, or the refresh token ends up in the browser's cookie store.
+
+.. py:attribute:: OIDC_USE_TOKEN_EXPIRATION
+
+   :default: ``False``
+
+   When enabled, the session expiry used by the refresh middlewares is derived from the
+   token endpoint's real ``expires_in`` value instead of the synthetic
+   :attr:`OIDC_RENEW_ID_TOKEN_EXPIRY_SECONDS` interval.
+
+.. py:attribute:: OIDC_OP_DISCOVERY_ENDPOINT
+
+   :default: ``None``
+
+   URL used to auto-discover the provider endpoints via OIDC discovery
+   (``/.well-known/openid-configuration``). You can pass either the issuer/realm base URL
+   (for Keycloak, e.g. ``https://kc.example.com/realms/myrealm``) or the full well-known URL.
+
+   When set, ``OIDC_OP_AUTHORIZATION_ENDPOINT``, ``OIDC_OP_TOKEN_ENDPOINT``,
+   ``OIDC_OP_USER_ENDPOINT`` and ``OIDC_OP_JWKS_ENDPOINT`` no longer need to be configured;
+   any of them that is still set explicitly takes precedence over the discovered value.
+
+.. py:attribute:: OIDC_DISCOVERY_CACHE_TIMEOUT
+
+   :default: ``86400``
+
+   How long (in seconds) discovered provider metadata is cached.
+
+.. py:attribute:: OIDC_DISCOVERY_CACHE_ALIAS
+
+   :default: ``default``
+
+   The Django cache alias used to cache discovered provider metadata.
+
 .. py:attribute:: OIDC_AUTH_REQUEST_EXTRA_PARAMS
 
    :default: `{}`

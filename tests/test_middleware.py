@@ -14,7 +14,7 @@ from django.test.client import ClientHandler
 from django.urls import path
 from unittest.mock import MagicMock, patch
 
-from mozilla_django_oidc.middleware import SessionRefresh
+from mozilla_django_oidc.middleware import RefreshOIDCToken, SessionRefresh
 from mozilla_django_oidc.urls import urlpatterns as orig_urlpatterns
 
 User = get_user_model()
@@ -491,3 +491,189 @@ class MiddlewareTestCase(TestCase):
 
         # The signal we registered should have fired for this user.
         self.assertEqual(client.user, logged_out_users[0])
+
+
+@override_settings(OIDC_OP_AUTHORIZATION_ENDPOINT="http://example.com/authorize")
+@override_settings(OIDC_OP_TOKEN_ENDPOINT="http://example.com/token")
+@override_settings(OIDC_OP_USER_ENDPOINT="http://example.com/user")
+@override_settings(OIDC_RP_CLIENT_ID="foo")
+@override_settings(OIDC_RP_CLIENT_SECRET="client_secret")
+@override_settings(OIDC_STORE_REFRESH_TOKEN=True)
+@override_settings(OIDC_RENEW_ID_TOKEN_EXPIRY_SECONDS=120)
+class RefreshOIDCTokenMiddlewareTestCase(TestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.middleware = RefreshOIDCToken(MagicMock)
+        self.user = User.objects.create_user("example_username")
+
+    def _request(self, expired_session=True, method="get", **kwargs):
+        request = getattr(self.factory, method)("/foo", **kwargs)
+        request.user = self.user
+        request.session = {}
+        if expired_session:
+            request.session["oidc_id_token_expiration"] = time.time() - 100
+        return request
+
+    def test_requires_store_refresh_token_setting(self):
+        with override_settings(OIDC_STORE_REFRESH_TOKEN=False):
+            from django.core.exceptions import ImproperlyConfigured
+
+            with self.assertRaises(ImproperlyConfigured):
+                RefreshOIDCToken(MagicMock)
+
+    def test_anonymous(self):
+        request = self.factory.get("/foo")
+        request.session = {}
+        request.user = AnonymousUser()
+        self.assertIsNone(self.middleware.process_request(request))
+
+    def test_not_expired(self):
+        request = self._request(expired_session=False)
+        request.session["oidc_id_token_expiration"] = time.time() + 100
+        self.assertIsNone(self.middleware.process_request(request))
+
+    @patch("mozilla_django_oidc.middleware.get_random_string")
+    def test_no_refresh_token_falls_back_to_redirect(self, mock_random):
+        mock_random.return_value = "examplestring"
+        request = self._request()
+        response = self.middleware.process_request(request)
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response["Location"].startswith("http://example.com/authorize"))
+
+    def test_no_refresh_token_non_get_returns_403(self):
+        request = self._request(method="post")
+        response = self.middleware.process_request(request)
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(response["refresh_url"])
+
+    @patch("mozilla_django_oidc.middleware.get_random_string")
+    def test_expired_refresh_token_falls_back(self, mock_random):
+        mock_random.return_value = "examplestring"
+        request = self._request()
+        request.session["oidc_refresh_token"] = "old-refresh-token"
+        request.session["oidc_refresh_token_expiration"] = time.time() - 10
+        response = self.middleware.process_request(request)
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("oidc_refresh_token", request.session)
+
+    @patch("mozilla_django_oidc.auth.OIDCAuthenticationBackend.verify_token")
+    @patch("mozilla_django_oidc.auth.requests.post")
+    def test_successful_backchannel_refresh(self, mock_post, mock_verify):
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {
+            "id_token": "new_id_token",
+            "access_token": "new_access_token",
+            "refresh_token": "new_refresh_token",
+            "expires_in": 300,
+            "refresh_expires_in": 1800,
+        }
+        mock_post.return_value = mock_response
+        mock_verify.return_value = {"sub": "subject"}
+
+        request = self._request()
+        request.session["oidc_refresh_token"] = "old-refresh-token"
+
+        response = self.middleware.process_request(request)
+
+        # Transparent: no redirect, request continues.
+        self.assertIsNone(response)
+        # The refresh_token grant was posted to the token endpoint.
+        args, kwargs = mock_post.call_args
+        self.assertEqual(args[0], "http://example.com/token")
+        self.assertEqual(kwargs["data"]["grant_type"], "refresh_token")
+        self.assertEqual(kwargs["data"]["refresh_token"], "old-refresh-token")
+        # Rotated refresh token is stored, expirations updated.
+        self.assertEqual(request.session["oidc_refresh_token"], "new_refresh_token")
+        self.assertGreater(
+            request.session["oidc_id_token_expiration"], time.time() + 60
+        )
+        self.assertGreater(
+            request.session["oidc_refresh_token_expiration"], time.time() + 60
+        )
+
+    @patch("mozilla_django_oidc.auth.OIDCAuthenticationBackend.verify_token")
+    @patch("mozilla_django_oidc.auth.requests.post")
+    def test_successful_refresh_on_post_request(self, mock_post, mock_verify):
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {
+            "id_token": "new_id_token",
+            "access_token": "new_access_token",
+            "refresh_token": "new_refresh_token",
+            "expires_in": 300,
+        }
+        mock_post.return_value = mock_response
+        mock_verify.return_value = {"sub": "subject"}
+
+        request = self._request(method="post")
+        request.session["oidc_refresh_token"] = "old-refresh-token"
+        self.assertIsNone(self.middleware.process_request(request))
+        self.assertEqual(request.session["oidc_refresh_token"], "new_refresh_token")
+
+    @override_settings(OIDC_USE_TOKEN_EXPIRATION=True)
+    @patch("mozilla_django_oidc.auth.OIDCAuthenticationBackend.verify_token")
+    @patch("mozilla_django_oidc.auth.requests.post")
+    def test_real_expiration_used(self, mock_post, mock_verify):
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {
+            "id_token": "new_id_token",
+            "access_token": "new_access_token",
+            "refresh_token": "new_refresh_token",
+            "expires_in": 60,
+        }
+        mock_post.return_value = mock_response
+        mock_verify.return_value = {"sub": "subject"}
+
+        request = self._request()
+        request.session["oidc_refresh_token"] = "old-refresh-token"
+        self.assertIsNone(self.middleware.process_request(request))
+        self.assertAlmostEqual(
+            request.session["oidc_id_token_expiration"], time.time() + 60, delta=5
+        )
+
+    @patch("mozilla_django_oidc.middleware.get_random_string")
+    @patch("mozilla_django_oidc.auth.requests.post")
+    def test_invalid_grant_falls_back(self, mock_post, mock_random):
+        mock_random.return_value = "examplestring"
+        mock_response = MagicMock(status_code=400, text="invalid_grant")
+        mock_post.return_value = mock_response
+
+        request = self._request()
+        request.session["oidc_refresh_token"] = "old-refresh-token"
+        response = self.middleware.process_request(request)
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("oidc_refresh_token", request.session)
+
+    @patch("mozilla_django_oidc.auth.requests.post")
+    def test_invalid_grant_non_get_returns_403(self, mock_post):
+        mock_response = MagicMock(status_code=400, text="invalid_grant")
+        mock_post.return_value = mock_response
+
+        request = self._request(method="post")
+        request.session["oidc_refresh_token"] = "old-refresh-token"
+        response = self.middleware.process_request(request)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            json.loads(response.content)["refresh_url"], "/authenticate/"
+        )
+
+    @patch("mozilla_django_oidc.middleware.get_random_string")
+    @patch("mozilla_django_oidc.auth.OIDCAuthenticationBackend.verify_token")
+    @patch("mozilla_django_oidc.auth.requests.post")
+    def test_subject_mismatch_falls_back(self, mock_post, mock_verify, mock_random):
+        mock_random.return_value = "examplestring"
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = {
+            "id_token": "new_id_token",
+            "access_token": "new_access_token",
+            "refresh_token": "new_refresh_token",
+            "expires_in": 300,
+        }
+        mock_post.return_value = mock_response
+        mock_verify.side_effect = [{"sub": "other-subject"}, {"sub": "subject"}]
+
+        request = self._request()
+        request.session["oidc_refresh_token"] = "old-refresh-token"
+        request.session["oidc_id_token"] = "old_id_token"
+        response = self.middleware.process_request(request)
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("oidc_refresh_token", request.session)

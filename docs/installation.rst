@@ -224,6 +224,47 @@ The length of time it takes for an id token to expire is set in
 ``settings.OIDC_RENEW_ID_TOKEN_EXPIRY_SECONDS`` which defaults to 15 minutes.
 
 
+Server-side token refresh (Keycloak)
+------------------------------------
+
+Instead of redirecting the browser through the authorization endpoint,
+:py:class:`mozilla_django_oidc.middleware.RefreshOIDCToken` renews tokens
+transparently from the backend with the OAuth2 ``refresh_token`` grant.
+It works for all HTTP methods (including POST and XHR requests) and only
+falls back to the ``SessionRefresh`` front-channel flow when the refresh
+token is no longer valid (for example when the SSO session was ended).
+
+A minimal Keycloak configuration looks like this::
+
+    AUTHENTICATION_BACKENDS = (
+        'mozilla_django_oidc.auth.OIDCAuthenticationBackend',
+        # ...
+    )
+
+    MIDDLEWARE = [
+        # middleware involving session and authentication must come first
+        # ...
+        'mozilla_django_oidc.middleware.RefreshOIDCToken',
+        # ...
+    ]
+
+    # All OP endpoints are discovered from the realm's well-known document
+    OIDC_OP_DISCOVERY_ENDPOINT = 'https://keycloak.example.com/realms/myrealm'
+
+    OIDC_RP_CLIENT_ID = 'myclient'
+    OIDC_RP_CLIENT_SECRET = 'sekret'
+    OIDC_RP_SIGN_ALGO = 'RS256'
+
+    # Keep the refresh token in the (server-side) session and track the
+    # real token lifetimes reported by Keycloak
+    OIDC_STORE_REFRESH_TOKEN = True
+    OIDC_USE_TOKEN_EXPIRATION = True
+
+With ``OIDC_USE_TOKEN_EXPIRATION`` enabled the middleware refreshes as soon
+as the access token's real ``expires_in`` lifetime has passed, so the session
+tokens are renewed before your application ever uses an expired token.
+
+
 Connecting OIDC user identities to Django users
 -----------------------------------------------
 

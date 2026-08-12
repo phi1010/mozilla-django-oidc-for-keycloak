@@ -9,8 +9,10 @@ from django.urls import reverse
 from django.utils.crypto import get_random_string
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils.module_loading import import_string
+from django.utils.functional import cached_property
 from django.views.generic import View
 
+from mozilla_django_oidc import discovery
 from mozilla_django_oidc.utils import (
     absolutify,
     add_state_and_verifier_and_nonce_to_session,
@@ -55,12 +57,16 @@ class OIDCAuthenticationCallbackView(View):
 
         # Figure out when this id_token will expire. This is ignored unless you're
         # using the SessionRefresh middleware.
-        expiration_interval = self.get_settings(
-            "OIDC_RENEW_ID_TOKEN_EXPIRY_SECONDS", 60 * 15
-        )
-        self.request.session["oidc_id_token_expiration"] = (
-            time.time() + expiration_interval
-        )
+        token_expiration = self.request.session.get("oidc_token_expiration")
+        if self.get_settings("OIDC_USE_TOKEN_EXPIRATION", False) and token_expiration:
+            self.request.session["oidc_id_token_expiration"] = token_expiration
+        else:
+            expiration_interval = self.get_settings(
+                "OIDC_RENEW_ID_TOKEN_EXPIRY_SECONDS", 60 * 15
+            )
+            self.request.session["oidc_id_token_expiration"] = (
+                time.time() + expiration_interval
+            )
 
         return HttpResponseRedirect(self.success_url)
 
@@ -167,12 +173,23 @@ class OIDCAuthenticationRequestView(View):
     def __init__(self, *args, **kwargs):
         super(OIDCAuthenticationRequestView, self).__init__(*args, **kwargs)
 
-        self.OIDC_OP_AUTH_ENDPOINT = self.get_settings("OIDC_OP_AUTHORIZATION_ENDPOINT")
+        if discovery.discovery_url() is None:
+            # Without discovery configured, resolve the endpoint eagerly as
+            # upstream does. With discovery, it stays lazy (cached_property).
+            self.OIDC_OP_AUTH_ENDPOINT = self.get_settings(
+                "OIDC_OP_AUTHORIZATION_ENDPOINT"
+            )
         self.OIDC_RP_CLIENT_ID = self.get_settings("OIDC_RP_CLIENT_ID")
 
     @staticmethod
     def get_settings(attr, *args):
         return import_from_settings(attr, *args)
+
+    # Only reached when discovery is configured; otherwise __init__ sets the
+    # instance attribute eagerly (upstream behavior) and shadows this.
+    @cached_property
+    def OIDC_OP_AUTH_ENDPOINT(self):
+        return discovery.get_endpoint_setting("OIDC_OP_AUTHORIZATION_ENDPOINT")
 
     def get(self, request):
         """OIDC client authentication initialization HTTP endpoint"""

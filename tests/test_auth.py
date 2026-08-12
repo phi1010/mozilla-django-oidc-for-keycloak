@@ -1,3 +1,4 @@
+import time
 import json
 from unittest.mock import Mock, call, patch
 
@@ -1367,7 +1368,8 @@ class OIDCAuthenticationBackendES256WithJwksEndpointTestCase(TestCase):
 
         self.assertEqual(
             ctx.exception.args[0],
-            "ES256 alg requires OIDC_RP_IDP_SIGN_KEY or OIDC_OP_JWKS_ENDPOINT to be configured.",
+            "ES256 alg requires OIDC_RP_IDP_SIGN_KEY, OIDC_OP_JWKS_ENDPOINT "
+            "or OIDC_OP_DISCOVERY_ENDPOINT to be configured.",
         )
 
     @patch("mozilla_django_oidc.auth.requests")
@@ -1414,3 +1416,76 @@ class OIDCAuthenticationBackendES256WithJwksEndpointTestCase(TestCase):
 
         self.assertEqual(payload, data)
         mock_requests.get.assert_called_once()
+
+
+class StoreRefreshTokenTestCase(TestCase):
+    """Refresh token and expiration storage tests."""
+
+    @override_settings(OIDC_OP_TOKEN_ENDPOINT="https://server.example.com/token")
+    @override_settings(OIDC_OP_USER_ENDPOINT="https://server.example.com/user")
+    @override_settings(OIDC_RP_CLIENT_ID="example_id")
+    @override_settings(OIDC_RP_CLIENT_SECRET="client_secret")
+    def setUp(self):
+        self.backend = OIDCAuthenticationBackend()
+        self.backend.request = Mock()
+        self.backend.request.session = {}
+
+    @override_settings(OIDC_STORE_REFRESH_TOKEN=True)
+    def test_refresh_token_stored(self):
+        self.backend.store_tokens("access", "id", "refresh")
+        self.assertEqual(
+            self.backend.request.session["oidc_refresh_token"], "refresh"
+        )
+
+    def test_refresh_token_not_stored_by_default(self):
+        self.backend.store_tokens("access", "id", "refresh")
+        self.assertNotIn("oidc_refresh_token", self.backend.request.session)
+
+    @override_settings(OIDC_STORE_REFRESH_TOKEN=True)
+    def test_compat_call_with_new_signature(self):
+        self.backend.store_tokens_compat("access", "id", "refresh")
+        self.assertEqual(
+            self.backend.request.session["oidc_refresh_token"], "refresh"
+        )
+
+    @override_settings(OIDC_STORE_REFRESH_TOKEN=True)
+    @override_settings(OIDC_STORE_ACCESS_TOKEN=True)
+    def test_compat_call_with_old_signature_override(self):
+        calls = []
+
+        class LegacyBackend(OIDCAuthenticationBackend):
+            def store_tokens(self, access_token, id_token):
+                calls.append((access_token, id_token))
+
+        with override_settings(
+            OIDC_OP_TOKEN_ENDPOINT="https://server.example.com/token",
+            OIDC_OP_USER_ENDPOINT="https://server.example.com/user",
+            OIDC_RP_CLIENT_ID="example_id",
+            OIDC_RP_CLIENT_SECRET="client_secret",
+        ):
+            backend = LegacyBackend()
+        backend.request = Mock()
+        backend.request.session = {}
+
+        backend.store_tokens_compat("access", "id", "refresh")
+        # The legacy override was called and the refresh token still stored.
+        self.assertEqual(calls, [("access", "id")])
+        self.assertEqual(backend.request.session["oidc_refresh_token"], "refresh")
+
+    def test_token_expirations_stored(self):
+        self.backend.store_token_expirations(
+            {"expires_in": 300, "refresh_expires_in": 1800}
+        )
+        session = self.backend.request.session
+        self.assertAlmostEqual(
+            session["oidc_token_expiration"], time.time() + 300, delta=5
+        )
+        self.assertAlmostEqual(
+            session["oidc_refresh_token_expiration"], time.time() + 1800, delta=5
+        )
+
+    def test_token_expirations_absent(self):
+        self.backend.store_token_expirations({})
+        session = self.backend.request.session
+        self.assertNotIn("oidc_token_expiration", session)
+        self.assertNotIn("oidc_refresh_token_expiration", session)

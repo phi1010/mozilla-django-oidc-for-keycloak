@@ -3,6 +3,21 @@
 History
 -------
 
+Unreleased (Keycloak fork)
+==========================
+
+* Add OIDC discovery support: set ``OIDC_OP_DISCOVERY_ENDPOINT`` to the realm/issuer
+  URL and the ``OIDC_OP_*`` endpoints are resolved automatically from the provider's
+  ``/.well-known/openid-configuration`` document (cached, explicit settings win).
+* Add ``RefreshOIDCToken`` middleware that renews expired tokens server-side with the
+  ``refresh_token`` grant (all HTTP methods), falling back to the ``SessionRefresh``
+  front-channel flow when the refresh token is invalid.
+* Add ``OIDC_STORE_REFRESH_TOKEN`` to persist the refresh token in the session
+  (``oidc_refresh_token``), and record real token lifetimes
+  (``oidc_token_expiration``, ``oidc_refresh_token_expiration``).
+* Add ``OIDC_USE_TOKEN_EXPIRATION`` to base session refresh timing on the token
+  endpoint's real ``expires_in`` instead of ``OIDC_RENEW_ID_TOKEN_EXPIRY_SECONDS``.
+
 5.0.2 (2025-12-19)
 ==================
 
